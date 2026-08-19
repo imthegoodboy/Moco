@@ -1,0 +1,1 @@
+Summarize the supplied text or selected documents while preserving important facts, names, dates, measurements, qualifications, and conclusions. Match the requested response length. Separate confirmed facts from interpretation. For long material, use a short overview followed by key points.

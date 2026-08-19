@@ -1,0 +1,20 @@
+import { ArrowLeft, ArrowRight, Check, Cpu, Database, HardDrive, LockKeyhole, Sparkles } from "lucide-react";
+import { useState } from "react";
+import { formatBytes } from "../lib/format";
+import type { HardwareInfo, ModelInfo } from "../types";
+
+interface OnboardingProps { hardware: HardwareInfo; model: ModelInfo; onComplete: () => Promise<void> }
+
+export function Onboarding({ hardware, model, onComplete }: OnboardingProps) {
+  const [step, setStep] = useState(0);
+  const [finishing, setFinishing] = useState(false);
+  const finish = async () => { setFinishing(true); try { await onComplete(); } finally { setFinishing(false); } };
+  const pages = [
+    <div className="onboard-panel" key="welcome"><span className="onboard-icon"><Sparkles size={27} /></span><p className="eyebrow">WELCOME TO MOCO</p><h1>Private AI, ready where your work lives.</h1><p>Chat, understand documents, improve writing, and research without sending your data to a cloud service.</p><div className="trust-row"><span><LockKeyhole size={16} /> Offline by default</span><span><Database size={16} /> Local memory</span><span><Cpu size={16} /> Runs on your CPU</span></div></div>,
+    <div className="onboard-panel" key="hardware"><span className="onboard-icon"><Cpu size={27} /></span><p className="eyebrow">SYSTEM CHECK</p><h1>Your computer is ready.</h1><p>Moco checked the hardware needed for local AI.</p><div className="check-list"><div><span><Cpu size={17} /></span><p><strong>{hardware.cpu}</strong><small>{hardware.physicalCores} cores · {hardware.logicalCores} threads</small></p><Check size={17} /></div><div><span><Database size={17} /></span><p><strong>{formatBytes(hardware.totalRamBytes)} memory</strong><small>{formatBytes(hardware.availableRamBytes)} currently available</small></p><Check size={17} /></div><div><span><HardDrive size={17} /></span><p><strong>{formatBytes(hardware.availableDiskBytes)} storage free</strong><small>Enough for Moco and additional models</small></p><Check size={17} /></div></div></div>,
+    <div className="onboard-panel" key="model"><span className="onboard-icon model-letter">L</span><p className="eyebrow">BUILT-IN MODEL</p><h1>{model.name} comes with Moco.</h1><p>The lightweight model starts automatically when needed—no download, account, or API key.</p><div className="model-summary"><div><span>Parameters</span><strong>{model.parameters}</strong></div><div><span>Format</span><strong>{model.quantization}</strong></div><div><span>Size</span><strong>{formatBytes(model.sizeBytes)}</strong></div><div><span>Privacy</span><strong>100% local</strong></div></div></div>,
+    <div className="onboard-panel" key="privacy"><span className="onboard-icon"><LockKeyhole size={27} /></span><p className="eyebrow">YOUR DATA, YOUR DEVICE</p><h1>There is no Moco cloud.</h1><p>Conversations, documents, settings, and search indexes remain in your local app folder. API mode exists, but Moco only uses it when you explicitly choose it.</p><div className="privacy-principles"><p><Check size={15} /> No account required</p><p><Check size={15} /> No telemetry or behavioral tracking</p><p><Check size={15} /> Documents never upload in local mode</p><p><Check size={15} /> Delete local data whenever you want</p></div></div>,
+  ];
+  return <div className="onboarding"><div className="onboarding-brand"><span className="brand-mark">M</span><strong>Moco</strong></div><div className="onboarding-progress">{pages.map((_, index) => <i className={index <= step ? "active" : ""} key={index} />)}</div>{pages[step]}<div className="onboarding-actions"><button className="secondary-button" type="button" disabled={step === 0} onClick={() => setStep((value) => value - 1)}><ArrowLeft size={16} /> Back</button>{step < pages.length - 1 ? <button className="primary-button" type="button" onClick={() => setStep((value) => value + 1)}>Continue <ArrowRight size={16} /></button> : <button className="primary-button" type="button" disabled={finishing} onClick={() => void finish()}>{finishing ? "Preparing…" : "Start using Moco"} <ArrowRight size={16} /></button>}</div></div>;
+}
+

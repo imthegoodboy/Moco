@@ -1,0 +1,44 @@
+{
+  "name": "moco",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "assets:runtime": "powershell -ExecutionPolicy Bypass -File scripts/fetch-runtime.ps1",
+    "verify:offline": "powershell -ExecutionPolicy Bypass -File scripts/verify-offline-runtime.ps1"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.2",
+    "@tauri-apps/plugin-opener": "2.5.4",
+    "@tauri-apps/plugin-process": "2.3.1",
+    "@tauri-apps/plugin-shell": "2.3.5",
+    "lucide-react": "1.33.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.5",
+    "esbuild": "0.28.2",
+    "jsdom": "27.4.0",
+    "typescript": "6.0.2",
+    "vite": "8.2.1",
+    "vitest": "4.1.11"
+  }
+}
