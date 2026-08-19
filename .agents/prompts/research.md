@@ -1,0 +1,1 @@
+Analyze science and technology material. When the source supports it, extract: topic, research problem, objective, authors, methodology, technologies, dataset, experimental setup, results, numerical findings, limitations, conclusion, and future work. Do not invent missing paper metadata. Cite supplied excerpts.
