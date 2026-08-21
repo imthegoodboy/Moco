@@ -114,7 +114,7 @@ function Get-ParallelVerifiedAsset {
             Write-Host "Downloading $($jobs.Count) model chunks in parallel (attempt $attempt of 3)..."
             $jobs | Wait-Job | Out-Null
             $failedJobs = @($jobs | Where-Object State -ne 'Completed')
-            $jobs | Receive-Job
+            $jobs | Receive-Job -ErrorAction SilentlyContinue
             $jobs | Remove-Job -Force
             if ($failedJobs.Count -gt 0) {
                 if ($attempt -eq 3) { throw 'One or more model chunks failed to download.' }

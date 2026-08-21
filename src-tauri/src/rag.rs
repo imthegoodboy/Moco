@@ -69,10 +69,11 @@ pub fn chunk_text(text: &str, target_chars: usize, overlap_chars: usize) -> Vec<
         }
 
         if end < bytes.len() {
-            let search_start = start + (target_chars * 2 / 3).min(end - start);
-            if let Some(relative) =
-                text[search_start..end].rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
-            {
+            let mut search_start = start + (target_chars * 2 / 3).min(end - start);
+            while search_start < end && !text.is_char_boundary(search_start) {
+                search_start += 1;
+            }
+            if let Some(relative) = text[search_start..end].rfind(['.', '!', '?', '\n']) {
                 end = search_start + relative + 1;
             }
         }
@@ -109,7 +110,7 @@ pub fn build_context(sources: &[SourceRef]) -> String {
         return String::new();
     }
     let mut output = String::from(
-        "\n\nLOCAL DOCUMENT CONTEXT\nUse these excerpts as the source of truth. Cite them as [1], [2], etc.\n",
+        "LOCAL DOCUMENT EVIDENCE\nUse these excerpts as the source of truth for the question below.\n",
     );
     for (index, source) in sources.iter().enumerate() {
         let page = source
@@ -117,7 +118,7 @@ pub fn build_context(sources: &[SourceRef]) -> String {
             .map(|p| format!(", page {p}"))
             .unwrap_or_default();
         output.push_str(&format!(
-            "\n[{}] {}{}\n{}\n",
+            "\nEvidence [{}] — {}{}\n{}\n",
             index + 1,
             source.document_name,
             page,
@@ -145,6 +146,14 @@ mod tests {
             "A useful first sentence. A second sentence with more detail. A final sentence.";
         let chunks = chunk_text(input, 32, 8);
         assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|chunk| !chunk.trim().is_empty()));
+    }
+
+    #[test]
+    fn chunker_handles_multibyte_document_text() {
+        let input = "कृपया निम्नलिखित महत्वपूर्ण निर्देशों को ध्यानपूर्वक पढ़ें। ".repeat(40);
+        let chunks = chunk_text(&input, 100, 20);
+        assert!(chunks.len() > 1);
         assert!(chunks.iter().all(|chunk| !chunk.trim().is_empty()));
     }
 }

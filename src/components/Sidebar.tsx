@@ -117,12 +117,6 @@ export function Sidebar(props: SidebarProps) {
         <button type="button" className={props.view === "settings" ? "active" : ""} onClick={() => props.onView("settings")} title="Settings (Ctrl+,)">
           <Settings size={17} /> {!props.collapsed && <span>Settings</span>}
         </button>
-        {!props.collapsed && (
-          <div className="privacy-badge">
-            <span className="status-dot" />
-            <div><strong>Local by default</strong><span>No telemetry. Your data stays here.</span></div>
-          </div>
-        )}
       </div>
     </aside>
   );

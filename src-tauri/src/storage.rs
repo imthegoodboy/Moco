@@ -61,6 +61,11 @@ impl Database {
               ordinal INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_document ON document_chunks(document_id);
+            CREATE TABLE IF NOT EXISTS conversation_documents (
+              conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+              document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+              PRIMARY KEY (conversation_id, document_id)
+            );
             CREATE TABLE IF NOT EXISTS models (
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
@@ -311,14 +316,18 @@ impl Database {
     pub fn conversations(&self) -> Result<Vec<Conversation>> {
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT id, title, pinned, archived, created_at, updated_at FROM conversations ORDER BY pinned DESC, updated_at DESC",
+            "SELECT c.id, c.title, c.pinned, c.archived, c.created_at, c.updated_at,
+                    COALESCE((SELECT json_group_array(cd.document_id) FROM conversation_documents cd WHERE cd.conversation_id = c.id), '[]')
+             FROM conversations c ORDER BY c.pinned DESC, c.updated_at DESC",
         )?;
         let rows = statement.query_map([], |row| {
+            let document_ids: String = row.get(6)?;
             Ok(Conversation {
                 id: row.get(0)?,
                 title: row.get(1)?,
                 pinned: row.get(2)?,
                 archived: row.get(3)?,
+                document_ids: serde_json::from_str(&document_ids).unwrap_or_default(),
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
             })
@@ -334,6 +343,7 @@ impl Database {
             title: title.unwrap_or("New conversation").to_string(),
             pinned: false,
             archived: false,
+            document_ids: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         };
@@ -375,6 +385,30 @@ impl Database {
             .lock()
             .execute("DELETE FROM conversations WHERE id = ?1", [id])?;
         self.audit("conversation.deleted", id)?;
+        Ok(())
+    }
+
+    pub fn set_conversation_documents(
+        &self,
+        conversation_id: &str,
+        document_ids: &[String],
+    ) -> Result<()> {
+        let mut unique = std::collections::HashSet::new();
+        let connection = self.connection.lock();
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM conversation_documents WHERE conversation_id = ?1",
+            [conversation_id],
+        )?;
+        for document_id in document_ids {
+            if unique.insert(document_id) {
+                transaction.execute(
+                    "INSERT INTO conversation_documents (conversation_id, document_id) VALUES (?1, ?2)",
+                    params![conversation_id, document_id],
+                )?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -606,10 +640,13 @@ impl Database {
         document_ids: &[String],
         limit: usize,
     ) -> Result<Vec<SourceRef>> {
+        if document_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let query_vector = embed(query);
         let connection = self.connection.lock();
         let mut statement = connection.prepare(
-            "SELECT c.document_id, d.name, c.page, c.content, c.vector_json FROM document_chunks c JOIN documents d ON d.id = c.document_id",
+            "SELECT c.document_id, d.name, c.page, c.content, c.vector_json, c.ordinal FROM document_chunks c JOIN documents d ON d.id = c.document_id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -618,33 +655,40 @@ impl Database {
                 row.get::<_, Option<u32>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
         let allowed: std::collections::HashSet<&str> =
             document_ids.iter().map(String::as_str).collect();
         let mut scored = Vec::new();
         for row in rows {
-            let (document_id, document_name, page, content, vector_json) = row?;
-            if !allowed.is_empty() && !allowed.contains(document_id.as_str()) {
+            let (document_id, document_name, page, content, vector_json, ordinal) = row?;
+            if !allowed.contains(document_id.as_str()) {
                 continue;
             }
             let vector: Vec<f32> = serde_json::from_str(&vector_json).unwrap_or_default();
             let semantic = cosine(&query_vector, &vector);
             let lexical = lexical_overlap(query, &content);
             let score = semantic * 0.7 + lexical * 0.3;
-            if score > 0.02 {
-                scored.push(SourceRef {
+            scored.push((
+                SourceRef {
                     document_id,
                     document_name,
                     page,
                     excerpt: content,
                     score,
-                });
-            }
+                },
+                ordinal,
+            ));
         }
-        scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+        scored.sort_by(|(left, left_ordinal), (right, right_ordinal)| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left_ordinal.cmp(right_ordinal))
+        });
         scored.truncate(limit);
-        Ok(scored)
+        Ok(scored.into_iter().map(|(source, _)| source).collect())
     }
 
     pub fn models(&self) -> Result<Vec<ModelInfo>> {
@@ -777,5 +821,110 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attached_document_returns_context_without_query_overlap() {
+        let path = std::env::temp_dir().join(format!("moco-rag-test-{}.db", Uuid::new_v4()));
+        let database = Database::open(&path).expect("test database should open");
+        database
+            .insert_document(
+                "selected-doc",
+                "notes.txt",
+                Path::new("notes.txt"),
+                "TXT",
+                42,
+                1,
+            )
+            .expect("test document should be inserted");
+        database
+            .insert_chunk(
+                "selected-doc",
+                None,
+                "Orchids need indirect sunlight and careful watering.",
+                0,
+            )
+            .expect("test chunk should be inserted");
+
+        let sources = database
+            .retrieve("Summarize the attachment", &["selected-doc".into()], 5)
+            .expect("retrieval should succeed");
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].document_id, "selected-doc");
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retrieval_without_attached_documents_returns_no_sources() {
+        let path = std::env::temp_dir().join(format!("moco-rag-empty-test-{}.db", Uuid::new_v4()));
+        let database = Database::open(&path).expect("test database should open");
+        database
+            .insert_document(
+                "unselected-doc",
+                "private.txt",
+                Path::new("private.txt"),
+                "TXT",
+                20,
+                1,
+            )
+            .expect("test document should be inserted");
+        database
+            .insert_chunk("unselected-doc", None, "Private project details.", 0)
+            .expect("test chunk should be inserted");
+
+        let sources = database
+            .retrieve("project details", &[], 5)
+            .expect("retrieval should succeed");
+
+        assert!(sources.is_empty());
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn document_bindings_are_isolated_per_conversation() {
+        let path = std::env::temp_dir().join(format!("moco-chat-doc-test-{}.db", Uuid::new_v4()));
+        let database = Database::open(&path).expect("test database should open");
+        database
+            .insert_document(
+                "chat-one-doc",
+                "chat-one.txt",
+                Path::new("chat-one.txt"),
+                "TXT",
+                20,
+                1,
+            )
+            .expect("test document should be inserted");
+        let first = database
+            .create_conversation(Some("First"))
+            .expect("first conversation should be created");
+        let second = database
+            .create_conversation(Some("Second"))
+            .expect("second conversation should be created");
+        database
+            .set_conversation_documents(&first.id, &["chat-one-doc".into()])
+            .expect("document should bind to first conversation");
+
+        let conversations = database.conversations().expect("conversations should load");
+        let loaded_first = conversations
+            .iter()
+            .find(|conversation| conversation.id == first.id)
+            .expect("first conversation should exist");
+        let loaded_second = conversations
+            .iter()
+            .find(|conversation| conversation.id == second.id)
+            .expect("second conversation should exist");
+
+        assert_eq!(loaded_first.document_ids, vec!["chat-one-doc"]);
+        assert!(loaded_second.document_ids.is_empty());
+        drop(database);
+        let _ = std::fs::remove_file(path);
     }
 }

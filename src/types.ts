@@ -24,6 +24,7 @@ export interface Conversation {
   title: string;
   pinned: boolean;
   archived: boolean;
+  documentIds: string[];
   createdAt: string;
   updatedAt: string;
 }

@@ -36,6 +36,7 @@ interface ComposerProps {
   selectedDocumentIds: string[];
   documentsOnly: boolean;
   generating: boolean;
+  importing?: string;
   onChange: (value: string) => void;
   onToolChange: (tool: AgentTool) => void;
   onDocumentsOnly: (value: boolean) => void;
@@ -67,8 +68,11 @@ export function Composer(props: ComposerProps) {
 
   return (
     <div className="composer-wrap">
-      <div className={`composer ${props.generating ? "composer-active" : ""}`}>
-        {props.selectedDocumentIds.length > 0 && (
+      <div
+        className={`composer ${props.generating ? "composer-active" : ""}`}
+        aria-busy={Boolean(props.importing)}
+      >
+        {(props.selectedDocumentIds.length > 0 || props.importing) && (
           <div className="attachment-row">
             {props.selectedDocumentIds.map((id) => {
               const document = props.documents.find((item) => item.id === id);
@@ -87,6 +91,12 @@ export function Composer(props: ComposerProps) {
                 </span>
               );
             })}
+            {props.importing && (
+              <span className="attachment-status">
+                <span className="activity-spinner" />
+                <span>{props.importing}</span>
+              </span>
+            )}
           </div>
         )}
         <textarea
@@ -117,7 +127,9 @@ export function Composer(props: ComposerProps) {
               type="button"
               className="composer-icon"
               onClick={props.onAttach}
-              title="Attach documents (Ctrl+O)"
+              title={props.importing ? "Indexing document" : "Attach documents (Ctrl+O)"}
+              aria-label={props.importing ? "Indexing document" : "Attach documents"}
+              disabled={Boolean(props.importing)}
             >
               <Paperclip size={18} />
             </button>

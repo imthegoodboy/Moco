@@ -14,13 +14,15 @@ use crate::rag::{build_context, chunk_text};
 use crate::storage::Database;
 use anyhow::{Context, Result, anyhow, bail};
 use parking_lot::Mutex;
+use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use sysinfo::{Disks, System};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 const CORE_PROMPT: &str = include_str!("../../.agents/prompts/system.md");
+const CHAT_PROMPT: &str = include_str!("../../.agents/prompts/chat.md");
 const SUMMARIZE_PROMPT: &str = include_str!("../../.agents/prompts/summarize.md");
 const RESEARCH_PROMPT: &str = include_str!("../../.agents/prompts/research.md");
 const NEWS_PROMPT: &str = include_str!("../../.agents/prompts/news.md");
@@ -30,6 +32,27 @@ const EXPLAIN_PROMPT: &str = include_str!("../../.agents/prompts/explain.md");
 const COMPARE_PROMPT: &str = include_str!("../../.agents/prompts/compare.md");
 const AGENT_PROMPT: &str = include_str!("../../.agents/prompts/agent.md");
 const DOCUMENTS_PROMPT: &str = include_str!("../../.agents/prompts/documents.md");
+
+static CHAT_TYPO_REPLACEMENTS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    [
+        (r"(?i)\bwht\b", "what"),
+        (r"(?i)\bur\b", "your"),
+        (r"(?i)\bu\b", "you"),
+        (r"(?i)\bteh\b", "the"),
+        (r"(?i)\bhappned\b", "happened"),
+        (r"(?i)\bdocumn(?:et|met)\b", "document"),
+        (r"(?i)\bseprate\b", "separate"),
+        (r"(?i)\bnromal\b", "normal"),
+    ]
+    .into_iter()
+    .map(|(pattern, replacement)| {
+        (
+            Regex::new(pattern).expect("chat typo pattern should be valid"),
+            replacement,
+        )
+    })
+    .collect()
+});
 
 struct AppCore {
     database: Database,
@@ -122,18 +145,18 @@ fn windows_gpu_info() -> (String, u64) {
             ])
             .creation_flags(0x08000000)
             .output();
-        if let Ok(output) = output {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                let name = value
-                    .get("Name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Windows GPU");
-                let ram = value
-                    .get("AdapterRAM")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                return (name.into(), ram);
-            }
+        if let Ok(output) = output
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        {
+            let name = value
+                .get("Name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Windows GPU");
+            let ram = value
+                .get("AdapterRAM")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            return (name.into(), ram);
         }
     }
     ("Not reported".into(), 0)
@@ -175,6 +198,17 @@ fn set_conversation_flag(
 ) -> Result<(), String> {
     core.database
         .set_conversation_flag(&id, &flag, value)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+fn set_conversation_documents(
+    id: String,
+    document_ids: Vec<String>,
+    core: CoreState<'_>,
+) -> Result<(), String> {
+    core.database
+        .set_conversation_documents(&id, &document_ids)
         .map_err(command_error)
 }
 
@@ -230,6 +264,9 @@ async fn generate(
     if request.content.trim().is_empty() {
         return Err("Write a message before sending.".into());
     }
+    core.database
+        .set_conversation_documents(&request.conversation_id, &request.document_ids)
+        .map_err(command_error)?;
     let user_message = core
         .database
         .insert_message(
@@ -249,18 +286,8 @@ async fn generate(
     let app_core = core.inner().clone();
     let conversation_id = request.conversation_id.clone();
     tauri::async_runtime::spawn(async move {
-        let result = run_generation(
-            &app,
-            &app_core,
-            &generation_id,
-            &conversation_id,
-            &request.content,
-            &request.mode,
-            &request.tool,
-            &request.document_ids,
-            &user_message.id,
-        )
-        .await;
+        let result =
+            run_generation(&app, &app_core, &generation_id, &request, &user_message.id).await;
         if let Err(error) = result {
             emit_error(&app, &generation_id, &conversation_id, &error);
         }
@@ -272,13 +299,14 @@ async fn run_generation(
     app: &AppHandle,
     core: &Arc<AppCore>,
     generation_id: &str,
-    conversation_id: &str,
-    content: &str,
-    mode: &str,
-    tool: &str,
-    document_ids: &[String],
+    request: &GenerateRequest,
     current_user_message_id: &str,
 ) -> Result<()> {
+    let conversation_id = request.conversation_id.as_str();
+    let content = request.content.as_str();
+    let mode = request.mode.as_str();
+    let tool = request.tool.as_str();
+    let document_ids = request.document_ids.as_slice();
     let settings = core.current_settings()?;
     emit_phase(app, generation_id, conversation_id, "understanding", &[]);
     let sources = core.database.retrieve(content, document_ids, 5)?;
@@ -318,14 +346,29 @@ async fn run_generation(
     } else {
         mode
     };
+    let normalized_content = if prompt_mode == "chat" {
+        normalize_chat_input(content)
+    } else {
+        content.to_string()
+    };
     let selected_prompt = selected_tool_prompt(tool);
-    let system_prompt = if selected_prompt.is_empty() {
+    let mut system_prompt = if selected_prompt.is_empty() {
         compose_system_prompt(prompt_mode, &settings)
     } else {
         selected_prompt.to_string()
     };
-    let user_content = format!("{}{}", content, build_context(&sources));
-    let request_history = if tool == "auto" {
+    if prompt_mode == "chat" && asks_assistant_name(&normalized_content) {
+        system_prompt.push_str("\nThe user is asking your name. Reply exactly: My name is Moco.");
+    }
+    let user_content = if sources.is_empty() {
+        normalized_content.clone()
+    } else {
+        format!(
+            "{}\n\nQUESTION\n{normalized_content}",
+            build_context(&sources)
+        )
+    };
+    let mut request_history = if tool == "auto" {
         history
             .into_iter()
             .filter(|message| message.id != current_user_message_id)
@@ -333,6 +376,25 @@ async fn run_generation(
     } else {
         Vec::new()
     };
+    if prompt_mode == "chat" {
+        if chat_needs_history(&normalized_content) {
+            request_history = request_history
+                .into_iter()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            for message in &mut request_history {
+                if message.role == "user" {
+                    message.content = normalize_chat_input(&message.content);
+                }
+            }
+        } else {
+            request_history.clear();
+        }
+    }
     let messages = chat_messages(&request_history, &system_prompt, &user_content);
     if use_desktop_tools {
         let desktop_root = std::env::var_os("USERPROFILE")
@@ -420,6 +482,47 @@ fn request_needs_desktop_tools(content: &str) -> bool {
     action && (target || looks_like_path)
 }
 
+fn normalize_chat_input(content: &str) -> String {
+    CHAT_TYPO_REPLACEMENTS
+        .iter()
+        .fold(content.to_string(), |normalized, (pattern, replacement)| {
+            pattern.replace_all(&normalized, *replacement).into_owned()
+        })
+}
+
+fn asks_assistant_name(content: &str) -> bool {
+    let content = content.to_ascii_lowercase();
+    content.contains("your name")
+        || content.contains("who are you")
+        || content.contains("what are you called")
+}
+
+fn chat_needs_history(content: &str) -> bool {
+    let content = content.to_ascii_lowercase();
+    let words = content
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let follow_up_phrase = [
+        "what do you mean",
+        "how so",
+        "tell me more",
+        "explain more",
+        "continue",
+        "go on",
+        "what about",
+        "how about",
+    ]
+    .iter()
+    .any(|phrase| content.contains(phrase));
+    let referential_word = [
+        "it", "that", "this", "these", "those", "they", "them", "he", "she", "there", "again",
+    ]
+    .iter()
+    .any(|candidate| words.contains(candidate));
+    follow_up_phrase || referential_word
+}
+
 fn selected_tool_prompt(tool: &str) -> &'static str {
     match tool {
         "documents" => DOCUMENTS_PROMPT,
@@ -433,6 +536,36 @@ fn selected_tool_prompt(tool: &str) -> &'static str {
 }
 
 fn compose_system_prompt(mode: &str, settings: &AppSettings) -> String {
+    if mode == "chat" {
+        let mut instructions = vec![CHAT_PROMPT.trim().to_string()];
+        match settings.response_style.as_str() {
+            "simple" => instructions.push("Use simple everyday language.".into()),
+            "professional" => instructions.push("Use a professional tone.".into()),
+            "technical" => instructions.push("Use precise technical language when useful.".into()),
+            "academic" => instructions.push("Use a clear academic tone.".into()),
+            _ => {}
+        }
+        match settings.response_length.as_str() {
+            "short" => instructions.push("Keep the answer short.".into()),
+            "detailed" => instructions
+                .push("Give a detailed answer when the question benefits from it.".into()),
+            _ => {}
+        }
+        if settings.documents_only {
+            instructions.push(
+                "Use only selected document evidence. If it does not contain the answer, say so."
+                    .into(),
+            );
+        }
+        if !settings.custom_instructions.trim().is_empty() {
+            instructions.push(format!(
+                "User's custom instructions:\n{}",
+                settings.custom_instructions
+            ));
+        }
+        return instructions.join("\n");
+    }
+
     let mode_prompt = match mode {
         "agent" => AGENT_PROMPT,
         "summarize" => SUMMARIZE_PROMPT,
@@ -601,6 +734,7 @@ async fn import_documents(
     core: CoreState<'_>,
 ) -> Result<Vec<DocumentInfo>, String> {
     let mut imported = Vec::new();
+    let mut errors = Vec::new();
     let import_id = Uuid::new_v4().to_string();
     let mut files = Vec::new();
     let mut pending: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
@@ -639,7 +773,7 @@ async fn import_documents(
                 error: None,
             },
         );
-        let result = import_one_document(path, core.inner().as_ref());
+        let result = import_one_document(path, core.inner().as_ref()).await;
         match result {
             Ok(document) => {
                 imported.push(document);
@@ -655,6 +789,7 @@ async fn import_documents(
                 );
             }
             Err(error) => {
+                errors.push(format!("{file_name}: {error}"));
                 let _ = app.emit(
                     "moco://import-progress",
                     ImportProgress {
@@ -668,10 +803,20 @@ async fn import_documents(
             }
         }
     }
+    if imported.is_empty() {
+        return Err(if errors.is_empty() {
+            "No readable content was found in the selected documents.".into()
+        } else {
+            format!(
+                "The selected documents could not be indexed: {}",
+                errors.join("; ")
+            )
+        });
+    }
     Ok(imported)
 }
 
-fn import_one_document(path: &Path, core: &AppCore) -> Result<DocumentInfo> {
+async fn import_one_document(path: &Path, core: &AppCore) -> Result<DocumentInfo> {
     if !supported_extension(path) {
         bail!("Supported files: PDF, DOCX, TXT, Markdown, CSV, and HTML.");
     }
@@ -679,7 +824,24 @@ fn import_one_document(path: &Path, core: &AppCore) -> Result<DocumentInfo> {
     if metadata.len() > 100 * 1024 * 1024 {
         bail!("This file is larger than the 100 MB import limit.");
     }
-    let pages = extract(path)?;
+    let pages = extract(path).await?;
+    let page_count = pages
+        .iter()
+        .filter_map(|page| page.page)
+        .max()
+        .unwrap_or(pages.len() as u32);
+    let chunks = pages
+        .into_iter()
+        .flat_map(|page| {
+            let page_number = page.page;
+            chunk_text(&page.text, 1_400, 180)
+                .into_iter()
+                .map(move |chunk| (page_number, chunk))
+        })
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        bail!("No readable text was found in this document.");
+    }
     let id = Uuid::new_v4().to_string();
     let documents_dir = core.data_directory.join("documents");
     std::fs::create_dir_all(&documents_dir)?;
@@ -695,11 +857,6 @@ fn import_one_document(path: &Path, core: &AppCore) -> Result<DocumentInfo> {
         .and_then(|ext| ext.to_str())
         .unwrap_or("file")
         .to_ascii_uppercase();
-    let page_count = pages
-        .iter()
-        .filter_map(|page| page.page)
-        .max()
-        .unwrap_or(pages.len() as u32);
     let document = core.database.insert_document(
         &id,
         original_name,
@@ -708,13 +865,8 @@ fn import_one_document(path: &Path, core: &AppCore) -> Result<DocumentInfo> {
         metadata.len(),
         page_count,
     )?;
-    let mut ordinal = 0usize;
-    for page in pages {
-        for chunk in chunk_text(&page.text, 1_400, 180) {
-            core.database
-                .insert_chunk(&id, page.page, &chunk, ordinal)?;
-            ordinal += 1;
-        }
+    for (ordinal, (page, chunk)) in chunks.into_iter().enumerate() {
+        core.database.insert_chunk(&id, page, &chunk, ordinal)?;
     }
     Ok(document)
 }
@@ -801,6 +953,7 @@ pub fn run() {
             create_conversation,
             rename_conversation,
             set_conversation_flag,
+            set_conversation_documents,
             delete_conversation,
             delete_message,
             set_message_feedback,
@@ -826,7 +979,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{request_needs_desktop_tools, selected_tool_prompt};
+    use super::*;
 
     #[test]
     fn everyday_questions_do_not_enter_the_tool_loop() {
@@ -849,9 +1002,111 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_common_chat_typos_before_local_inference() {
+        assert_eq!(
+            normalize_chat_input("wht is ur name and wht happned"),
+            "what is your name and what happened"
+        );
+        assert_eq!(
+            normalize_chat_input("What is an apple?"),
+            "What is an apple?"
+        );
+    }
+
+    #[test]
+    fn only_contextual_follow_ups_reuse_small_model_history() {
+        assert!(chat_needs_history("what do you mean?"));
+        assert!(chat_needs_history("tell me more about that"));
+        assert!(!chat_needs_history("what is an apple?"));
+        assert!(!chat_needs_history("what is your name?"));
+    }
+
+    #[test]
+    fn recognizes_assistant_identity_questions() {
+        assert!(asks_assistant_name("what is your name?"));
+        assert!(asks_assistant_name("who are you"));
+        assert!(!asks_assistant_name("what is an apple?"));
+    }
+
+    #[test]
     fn selected_tools_add_an_authoritative_instruction() {
         assert!(selected_tool_prompt("grammar").contains("Correct spelling"));
         assert!(selected_tool_prompt("summarize").contains("Summarize"));
         assert_eq!(selected_tool_prompt("auto"), "");
+    }
+
+    #[tokio::test]
+    async fn unicode_document_imports_and_supplies_rag_context() {
+        let test_root = std::env::temp_dir().join(format!("moco-document-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_root).expect("test directory should be created");
+        let source = test_root.join("instructions.txt");
+        std::fs::write(
+            &source,
+            "कृपया निम्नलिखित महत्वपूर्ण निर्देशों को ध्यानपूर्वक पढ़ें।\nThe interview starts at 9 AM.\n"
+                .repeat(40),
+        )
+        .expect("test document should be written");
+        let data_directory = test_root.join("data");
+        let core = AppCore {
+            database: Database::open(&data_directory.join("moco.db"))
+                .expect("test database should open"),
+            runtime: Arc::new(RuntimeManager::new(test_root.join("missing-runtime.exe"))),
+            data_directory,
+            session_api_key: Mutex::new(String::new()),
+            downloads: DownloadManager::new(),
+        };
+
+        let document = import_one_document(&source, &core)
+            .await
+            .expect("Unicode document should be indexed");
+        let sources = core
+            .database
+            .retrieve("Summarize the attachment", &[document.id], 5)
+            .expect("attached document should be retrieved");
+
+        assert!(!sources.is_empty());
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.excerpt.contains("interview starts at 9 AM"))
+        );
+        drop(core);
+        let _ = std::fs::remove_dir_all(test_root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires MOCO_OCR_FIXTURE pointing to an image-only PDF"]
+    async fn scanned_pdf_is_ocr_indexed_and_retrievable_for_chat() {
+        let source = PathBuf::from(
+            std::env::var("MOCO_OCR_FIXTURE").expect("OCR fixture path should be set"),
+        );
+        let test_root = std::env::temp_dir().join(format!("moco-ocr-rag-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&test_root).expect("test directory should be created");
+        let data_directory = test_root.join("data");
+        let core = AppCore {
+            database: Database::open(&data_directory.join("moco.db"))
+                .expect("test database should open"),
+            runtime: Arc::new(RuntimeManager::new(test_root.join("missing-runtime.exe"))),
+            data_directory,
+            session_api_key: Mutex::new(String::new()),
+            downloads: DownloadManager::new(),
+        };
+
+        let document = import_one_document(&source, &core)
+            .await
+            .expect("scanned PDF should be OCR indexed");
+        let sources = core
+            .database
+            .retrieve("What is the launch code?", &[document.id], 5)
+            .expect("OCR text should be retrievable");
+
+        assert!(
+            sources
+                .iter()
+                .any(|source| source.excerpt.to_ascii_lowercase().contains("pinky"))
+        );
+        drop(core);
+        let _ = std::fs::remove_dir_all(test_root);
     }
 }

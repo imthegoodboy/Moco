@@ -202,6 +202,7 @@ async function demoCall<T>(
       title: (args?.title as string | undefined) ?? "New conversation",
       pinned: false,
       archived: false,
+      documentIds: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -246,6 +247,13 @@ async function demoCall<T>(
     );
     if (conversation) conversation.title = args?.title as string;
   }
+  if (command === "set_conversation_documents") {
+    const conversation = demoData.conversations.find(
+      (item) => item.id === args?.id,
+    );
+    if (conversation)
+      conversation.documentIds = (args?.documentIds as string[]) ?? [];
+  }
   if (command === "delete_conversation") {
     demoData.conversations = demoData.conversations.filter(
       (item) => item.id !== args?.id,
@@ -265,6 +273,8 @@ export const desktop = {
     flag: "pinned" | "archived",
     value: boolean,
   ) => call<void>("set_conversation_flag", { id, flag, value }),
+  setConversationDocuments: (id: string, documentIds: string[]) =>
+    call<void>("set_conversation_documents", { id, documentIds }),
   deleteConversation: (id: string) => call<void>("delete_conversation", { id }),
   deleteMessage: (id: string) => call<void>("delete_message", { id }),
   setMessageFeedback: (id: string, feedback?: "up" | "down") =>

@@ -14,12 +14,14 @@ import { LibraryView } from "./components/LibraryView";
 import { MessageList } from "./components/MessageList";
 import { ModelsView } from "./components/ModelsView";
 import { Onboarding } from "./components/Onboarding";
+import { PetCow } from "./components/PetCow";
 import { SavedView } from "./components/SavedView";
 import { SettingsView } from "./components/SettingsView";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
 import { Topbar } from "./components/Topbar";
 import { desktop } from "./lib/desktop";
+import { playCowMoo } from "./lib/petAudio";
 import type {
   AgentTool,
   AppSettings,
@@ -83,6 +85,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [confirm, setConfirm] = useState<ConfirmState>();
   const [prompt, setPrompt] = useState<PromptState>();
+  const [petVisible, setPetVisible] = useState(false);
 
   const notify = useCallback(
     (message: string, type: Toast["type"] = "success") => {
@@ -134,7 +137,7 @@ export default function App() {
           notify(`${event.fileName}: ${event.error}`, "error");
         } else
           setImporting(
-            `${event.phase === "reading" ? "Reading" : "Indexing"} ${event.fileName} · ${event.percent}%`,
+            `${event.phase === "reading" ? "Extracting & indexing" : "Indexing"} ${event.fileName} · ${event.percent}%`,
           );
       })
       .then((unlisten) => {
@@ -280,13 +283,46 @@ export default function App() {
     (item) => item.id === activeConversationId,
   );
   const activeMessages = useMemo(
-    () =>
-      data?.messages.filter(
-        (item) => item.conversationId === activeConversationId,
-      ) ?? [],
-    [data?.messages, activeConversationId],
+    () => {
+      const allowedDocumentIds = new Set(activeConversation?.documentIds ?? []);
+      return (
+        data?.messages
+          .filter((item) => item.conversationId === activeConversationId)
+          .map((item) => ({
+            ...item,
+            sources: item.sources.filter((source) =>
+              allowedDocumentIds.has(source.documentId),
+            ),
+          })) ?? []
+      );
+    },
+    [data?.messages, activeConversationId, activeConversation?.documentIds],
   );
   const defaultModel = data?.models.find((item) => item.isDefault);
+
+  useEffect(() => {
+    setSelectedDocumentIds(activeConversation?.documentIds ?? []);
+  }, [activeConversationId, activeConversation?.documentIds]);
+
+  const bindDocuments = async (
+    conversationId: string,
+    documentIds: string[],
+  ) => {
+    await desktop.setConversationDocuments(conversationId, documentIds);
+    setSelectedDocumentIds(documentIds);
+    setData((current) =>
+      current
+        ? {
+            ...current,
+            conversations: current.conversations.map((conversation) =>
+              conversation.id === conversationId
+                ? { ...conversation, documentIds }
+                : conversation,
+            ),
+          }
+        : current,
+    );
+  };
 
   const newChat = async (preferredTool: AgentTool = "auto", seed = "") => {
     try {
@@ -304,8 +340,10 @@ export default function App() {
       setSelectedTool(preferredTool);
       setDraft(seed);
       setSelectedDocumentIds([]);
+      return conversation;
     } catch (error) {
       notify(String(error), "error");
+      return undefined;
     }
   };
 
@@ -361,6 +399,7 @@ export default function App() {
                           ? content.split(/\s+/).slice(0, 7).join(" ")
                           : conversation.title,
                       updatedAt: new Date().toISOString(),
+                      documentIds: selectedDocumentIds,
                     }
                   : conversation,
               ),
@@ -378,24 +417,39 @@ export default function App() {
   };
 
   const importDocuments = async (attachToChat = false) => {
-    const paths = await desktop.chooseDocuments();
-    if (!paths.length) return;
-    setImporting(
-      `Preparing ${paths.length} file${paths.length === 1 ? "" : "s"}…`,
-    );
     try {
+      const paths = await desktop.chooseDocuments();
+      if (!paths.length) return;
+      setImporting(
+        `Preparing ${paths.length} file${paths.length === 1 ? "" : "s"}…`,
+      );
       const documents = await desktop.importDocuments(paths);
       setData((current) =>
         current
           ? { ...current, documents: [...documents, ...current.documents] }
           : current,
       );
-      if (attachToChat)
-        setSelectedDocumentIds((ids) => [
-          ...new Set([...ids, ...documents.map((item) => item.id)]),
-        ]);
+      if (attachToChat) {
+        let conversationId = activeConversationId;
+        if (!conversationId) {
+          const conversation = await newChat("documents");
+          if (!conversation) return;
+          conversationId = conversation.id;
+        }
+        const documentIds = [
+          ...new Set([
+            ...selectedDocumentIds,
+            ...documents.map((item) => item.id),
+          ]),
+        ];
+        await bindDocuments(conversationId, documentIds);
+        setSelectedTool("documents");
+      }
+      const singlePdf = documents.length === 1 && documents[0].fileType === "PDF";
       notify(
-        `${documents.length} document${documents.length === 1 ? "" : "s"} indexed locally`,
+        singlePdf
+          ? `${documents[0].name} ready · ${documents[0].pageCount} page${documents[0].pageCount === 1 ? "" : "s"} extracted and indexed`
+          : `${documents.length} document${documents.length === 1 ? "" : "s"} indexed locally`,
       );
     } catch (error) {
       notify(String(error), "error");
@@ -437,9 +491,19 @@ export default function App() {
   };
 
   const askDocument = async (document: DocumentInfo) => {
-    await newChat("documents");
-    setSelectedDocumentIds([document.id]);
+    const conversation = await newChat("documents");
+    if (!conversation) return;
+    await bindDocuments(conversation.id, [document.id]);
     setDraft(`Tell me the most important things in ${document.name}.`);
+  };
+
+  const togglePet = () => {
+    if (petVisible) {
+      setPetVisible(false);
+      return;
+    }
+    playCowMoo();
+    setPetVisible(true);
   };
 
   const exportChat = async () => {
@@ -584,6 +648,10 @@ export default function App() {
           onNewChat={() => void newChat()}
           onSelectChat={(id) => {
             setActiveConversationId(id);
+            setSelectedDocumentIds(
+              data.conversations.find((item) => item.id === id)?.documentIds ??
+                [],
+            );
             setView("chat");
           }}
           onRename={(conversation) =>
@@ -685,8 +753,10 @@ export default function App() {
             model={defaultModel}
             sidebarCollapsed={sidebarCollapsed}
             provider={data.settings.provider}
+            petVisible={petVisible}
             onToggleSidebar={() => setSidebarCollapsed(false)}
             onModels={() => setView("models")}
+            onPet={togglePet}
             onExport={
               activeConversation && activeMessages.length
                 ? () => void exportChat()
@@ -791,15 +861,19 @@ export default function App() {
                 selectedDocumentIds={selectedDocumentIds}
                 documentsOnly={data.settings.documentsOnly}
                 generating={Boolean(generation && !generation.error)}
+                importing={importing}
                 onChange={setDraft}
                 onToolChange={setSelectedTool}
                 onDocumentsOnly={setDocumentsOnly}
                 onAttach={() => void importDocuments(true)}
-                onRemoveDocument={(id) =>
-                  setSelectedDocumentIds((ids) =>
-                    ids.filter((item) => item !== id),
-                  )
-                }
+                onRemoveDocument={(id) => {
+                  const documentIds = selectedDocumentIds.filter(
+                    (item) => item !== id,
+                  );
+                  if (activeConversationId)
+                    void bindDocuments(activeConversationId, documentIds);
+                  else setSelectedDocumentIds(documentIds);
+                }}
                 onSubmit={() => void send()}
                 onStop={() => void stop()}
               />
@@ -818,21 +892,33 @@ export default function App() {
                   message: `“${document.name}” and its local search index will be deleted.`,
                   confirmLabel: "Remove",
                   danger: true,
-                  onConfirm: () =>
-                    void desktop
-                      .deleteDocument(document.id)
-                      .then(() =>
-                        setData((current) =>
-                          current
-                            ? {
-                                ...current,
-                                documents: current.documents.filter(
-                                  (item) => item.id !== document.id,
-                                ),
-                              }
-                            : current,
-                        ),
-                      ),
+                    onConfirm: () =>
+                      void desktop
+                        .deleteDocument(document.id)
+                        .then(() => {
+                          setSelectedDocumentIds((ids) =>
+                            ids.filter((id) => id !== document.id),
+                          );
+                          setData((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  documents: current.documents.filter(
+                                    (item) => item.id !== document.id,
+                                  ),
+                                  conversations: current.conversations.map(
+                                    (conversation) => ({
+                                      ...conversation,
+                                      documentIds:
+                                        conversation.documentIds.filter(
+                                          (id) => id !== document.id,
+                                        ),
+                                    }),
+                                  ),
+                                }
+                              : current,
+                          );
+                        }),
                 })
               }
             />
@@ -931,6 +1017,7 @@ export default function App() {
           )}
         </section>
       </div>
+      {petVisible && <PetCow />}
       <ToastStack
         toasts={toasts}
         onDismiss={(id) =>

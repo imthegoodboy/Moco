@@ -100,11 +100,11 @@ impl RuntimeManager {
             if self.health().await {
                 return Ok(());
             }
-            if let Some(process) = self.process.lock().await.as_mut() {
-                if let Some(status) = process.try_wait()? {
-                    *self.loaded_model.lock().await = None;
-                    bail!("The local AI runtime stopped during model loading ({status}).");
-                }
+            if let Some(process) = self.process.lock().await.as_mut()
+                && let Some(status) = process.try_wait()?
+            {
+                *self.loaded_model.lock().await = None;
+                bail!("The local AI runtime stopped during model loading ({status}).");
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

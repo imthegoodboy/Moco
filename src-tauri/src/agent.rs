@@ -97,6 +97,7 @@ pub async fn run_agent(
 
         if calls.is_empty() {
             if let Some((name, arguments)) = compatibility_action(&content) {
+                let arguments = normalize_tool_arguments(&name, arguments, &request);
                 let label = tool_label(&name, &arguments);
                 emit_phase(
                     app,
@@ -170,6 +171,7 @@ pub async fn run_agent(
             } else {
                 raw_arguments
             };
+            let arguments = normalize_tool_arguments(name, arguments, &request);
             let label = tool_label(name, &arguments);
             emit_phase(
                 app,
@@ -302,6 +304,24 @@ fn compatibility_action(content: &str) -> Option<(String, Value)> {
         .cloned()
         .unwrap_or_else(|| json!({}));
     Some((name.into(), arguments))
+}
+
+fn normalize_tool_arguments(name: &str, mut arguments: Value, request: &str) -> Value {
+    if name == "list_files"
+        && request
+            .split(|character: char| !character.is_alphanumeric())
+            .any(|word| word == "desktop")
+    {
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if path.is_empty() || matches!(path, "." | "./" | ".\\") {
+            arguments["path"] = Value::String("Desktop".into());
+        }
+    }
+    arguments
 }
 
 fn tool_label(name: &str, arguments: &Value) -> String {
@@ -454,7 +474,7 @@ fn read_file(
     let selected = text
         .lines()
         .enumerate()
-        .filter(|(index, _)| index + 1 >= start && index + 1 <= end)
+        .filter(|(index, _)| index + 1 >= start && *index < end)
         .map(|(index, line)| format!("{:>5} | {line}", index + 1))
         .collect::<Vec<_>>();
     if selected.is_empty() {
@@ -483,16 +503,15 @@ fn search_files(
     let normalized_extension = extension.map(|value| value.trim_start_matches('.').to_lowercase());
     let mut matches = Vec::new();
     for path in paths.into_iter().take(4000) {
-        if let Some(expected) = &normalized_extension {
-            if path
+        if let Some(expected) = &normalized_extension
+            && path
                 .extension()
                 .and_then(|value| value.to_str())
                 .map(str::to_lowercase)
                 .as_deref()
                 != Some(expected)
-            {
-                continue;
-            }
+        {
+            continue;
         }
         let Ok(metadata) = path.metadata() else {
             continue;
@@ -609,7 +628,7 @@ async fn run_check(workspace: &Path, raw: &str) -> Result<String> {
         .map_err(|_| anyhow!("Validation timed out after 120 seconds."))??;
     let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.stderr.is_empty() {
-        combined.push_str("\n");
+        combined.push('\n');
         combined.push_str(&String::from_utf8_lossy(&output.stderr));
     }
     let status = if output.status.success() {
@@ -759,5 +778,15 @@ mod tests {
         assert!(validate_check_command(&["git", "status", "--short"]).is_ok());
         assert!(validate_check_command(&["powershell", "Remove-Item", "x"]).is_err());
         assert!(validate_check_command(&["npm", "test", "&&", "whoami"]).is_err());
+    }
+
+    #[test]
+    fn normalizes_desktop_list_target_for_small_models() {
+        let arguments = normalize_tool_arguments(
+            "list_files",
+            json!({ "path": ".", "depth": 1 }),
+            "list the files on my desktop",
+        );
+        assert_eq!(arguments["path"], "Desktop");
     }
 }

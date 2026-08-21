@@ -1,4 +1,5 @@
 import { ChevronDown, MoreHorizontal, PanelLeft, Share2 } from "lucide-react";
+import pinkyCow from "../assets/pinky-cow.webp";
 import type { Conversation, ModelInfo } from "../types";
 
 interface TopbarProps {
@@ -9,6 +10,8 @@ interface TopbarProps {
   provider: "local" | "api";
   onToggleSidebar: () => void;
   onModels: () => void;
+  onPet: () => void;
+  petVisible: boolean;
   onExport?: () => void;
 }
 
@@ -23,6 +26,16 @@ export function Topbar(props: TopbarProps) {
         </div>
       </div>
       <div className="topbar-actions">
+        <button
+          className={`pet-toggle ${props.petVisible ? "active" : ""}`}
+          type="button"
+          onClick={props.onPet}
+          aria-pressed={props.petVisible}
+          title={props.petVisible ? "Hide Pinky" : "Launch Pinky"}
+        >
+          <img className="pet-toggle-icon" src={pinkyCow} alt="" />
+          <span>Pet</span>
+        </button>
         <button className="model-pill" type="button" onClick={props.onModels}>
           <span className={`status-dot ${props.model?.status === "error" ? "error" : ""}`} />
           <span>{props.provider === "local" ? props.model?.name ?? "Local model" : "API model"}</span>

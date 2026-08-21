@@ -7,6 +7,7 @@ pub struct Conversation {
     pub title: String,
     pub pinned: bool,
     pub archived: bool,
+    pub document_ids: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
